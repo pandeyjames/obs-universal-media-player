@@ -1,0 +1,35 @@
+# Exclude everything
+/*
+
+# Except for default project files
+!/.github
+!/build-aux
+!/cmake
+!/data
+!/scripts
+!/src
+!.clang-format
+!.gersemirc
+!.gitignore
+!buildspec.json
+!CMakeLists.txt
+!CMakePresets.json
+!install.ps1
+!LICENSE
+!manage-obs-sources.ps1
+!README.md
+!THIRD-PARTY-NOTICES.md
+!uninstall.ps1
+
+# Third-party executables are fetched by scripts/fetch-windows-dependencies.ps1.
+# Complete bundled binaries are published as GitHub Release assets.
+/data/bin/
+
+# Exclude lock files
+*.lock.json
+
+# Exclude macOS legacy resource forks
+.DS_Store
+
+# Exclude CMake build number cache
+/cmake/.CMakeBuildNumber
