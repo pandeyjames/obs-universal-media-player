@@ -41,6 +41,70 @@ Streamlink is particularly useful for live channels. yt-dlp provides broader
 website, VOD, clip, and audio support. Source information shows which resolver
 actually succeeded when Auto mode is selected.
 
+## Architecture
+
+Universal Media Player is a native OBS input source implemented in C. It does
+not embed a browser and it does not ask Streamlink or yt-dlp to play media.
+Those tools are used only to resolve website URLs into direct playable stream
+URLs.
+
+```text
+OBS Add Source
+  -> universal_media_player source
+      -> resolver engine
+          -> direct URL bypass
+          -> yt-dlp --get-url
+          -> Streamlink --stream-url
+      -> private OBS ffmpeg_source
+          -> OBS video renderer
+          -> OBS audio mixer
+      -> scene item transform controls
+          -> fit / stretch / center / reset on the active scene
+```
+
+### Source Layer
+
+The plugin registers one OBS source type: `universal_media_player`. Each source
+instance owns a private `ffmpeg_source` child. The child is not shown as a
+separate user source; it is used internally so OBS still handles decoding,
+network buffering, hardware decoding, audio mixing, media controls, and
+rendering through its native media pipeline.
+
+### Resolver Layer
+
+The resolver layer runs external tools as short-lived child processes:
+
+- `yt-dlp.exe --get-url` for broad website, VOD, clip, and audio support
+- `streamlink.exe --stream-url` for live-stream focused providers
+- direct passthrough for already-playable media or network stream URLs
+
+Auto mode chooses a preferred resolver based on the provider and URL, then tries
+the other resolver if the first one fails. The resolved URL is passed to the
+private OBS Media Source as its input.
+
+### Bundled Dependencies
+
+Windows releases bundle pinned versions of yt-dlp and the official portable
+Streamlink runtime. The Git repository does not commit generated third-party
+executables. Instead, `scripts/fetch-windows-dependencies.ps1` downloads the
+pinned artifacts and verifies SHA-256 hashes before placing them under
+`data/bin`.
+
+### Playback And Transforms
+
+Playback is always handled by OBS, not by yt-dlp or Streamlink. The source
+implements OBS media-control callbacks and forwards play, pause, restart, stop,
+duration, and seek operations to the private media child.
+
+Canvas scaling is applied through OBS scene-item transforms on the active scene:
+
+- Fit uses `OBS_BOUNDS_SCALE_INNER`
+- Stretch uses `OBS_BOUNDS_STRETCH`
+- Center updates the item position and alignment
+- Reset clears bounds, scale, rotation, and crop
+
+This keeps source sizing compatible with OBS's own Transform menu behavior.
+
 ## Install
 
 1. Close OBS.
@@ -86,24 +150,6 @@ The **Preview canvas scaling** menu provides:
 **Apply Scaling to Current Scene** changes this source in the active scene.
 Enable **Automatically fit to canvas after resolving** to fit streams after
 they are resolved or refreshed.
-
-## Global source cleanup
-
-OBS can retain a source globally after its final scene item has been removed.
-Close OBS, then list all sources in the current scene collection:
-
-```powershell
-.\manage-obs-sources.ps1 -List
-```
-
-Remove a source and every scene/group reference to it:
-
-```powershell
-.\manage-obs-sources.ps1 -Name "Universal Media Player"
-```
-
-The utility creates a timestamped backup of the scene collection before making
-changes. When multiple collections exist, add `-Collection "Collection Name"`.
 
 ## Live streams
 
