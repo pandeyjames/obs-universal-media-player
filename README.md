@@ -48,6 +48,11 @@ The preview can stay blank while download/remux is running. For long VODs, this
 can take a long time because the entire video must be downloaded and merged
 before OBS can open the completed local file.
 
+Download/remux runs in the background. The source **Status** field updates with
+yt-dlp progress lines, including percent, speed, ETA, and merge steps when
+reported by yt-dlp. After completion, **Source information** shows the cached
+file path and the cached resolution reported by yt-dlp.
+
 Resolver and remux processes started from the bundled `yt-dlp`, Streamlink, and
 FFmpeg runtime are attached to the OBS process on Windows. If OBS exits or is
 terminated, Windows also terminates that bundled process tree. On the next

@@ -5,6 +5,7 @@
 #include <util/dstr.h>
 #include <util/pipe.h>
 #include <util/platform.h>
+#include <util/threading.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -53,6 +54,21 @@ struct universal_media {
 	obs_source_t *media;
 	char *resolved_by;
 	char *cache_path;
+	char *cache_key;
+	char *cache_resolution;
+	pthread_mutex_t mutex;
+	pthread_t download_thread;
+	bool download_thread_active;
+	bool download_running;
+	bool download_complete;
+	bool download_success;
+	char *download_result;
+	char *download_error;
+	char *download_progress;
+	char *download_key;
+	char *download_resolution;
+	obs_data_t *download_settings;
+	float status_update_timer;
 	bool active;
 };
 
@@ -278,6 +294,9 @@ static void update_source_info(struct universal_media *context, obs_data_t *sett
 
 	if (context && context->cache_path && *context->cache_path)
 		dstr_catf(&info, "\n%s: %s", obs_module_text("InfoCachedFile"), context->cache_path);
+	if (context && context->cache_resolution && *context->cache_resolution)
+		dstr_catf(&info, "\n%s: %s", obs_module_text("InfoCachedResolution"),
+			  context->cache_resolution);
 
 	obs_data_set_string(settings, S_SOURCE_INFO, info.array);
 	dstr_free(&info);
@@ -370,6 +389,77 @@ static void read_pipe(struct dstr *output, os_process_pipe_t *pipe, bool error_s
 	} while (length);
 }
 
+static void set_download_progress(struct universal_media *context, const char *message)
+{
+	pthread_mutex_lock(&context->mutex);
+	bfree(context->download_progress);
+	context->download_progress = bstrdup(message && *message ? message : obs_module_text("StatusDownloading"));
+	pthread_mutex_unlock(&context->mutex);
+}
+
+static void set_download_finished(struct universal_media *context, bool success, const char *result,
+				  const char *error)
+{
+	pthread_mutex_lock(&context->mutex);
+	context->download_running = false;
+	context->download_complete = true;
+	context->download_success = success;
+	bfree(context->download_result);
+	context->download_result = result && *result ? bstrdup(result) : NULL;
+	bfree(context->download_error);
+	context->download_error = error && *error ? bstrdup(error) : NULL;
+	pthread_mutex_unlock(&context->mutex);
+}
+
+static void update_progress_from_line(struct universal_media *context, const char *line)
+{
+	if (!line || !*line)
+		return;
+
+	while (*line == '\r' || *line == '\n' || *line == ' ' || *line == '\t')
+		line++;
+
+	if (!*line)
+		return;
+
+	if (strstr(line, "[download]") || strstr(line, "[Merger]") || strstr(line, "[ExtractAudio]") ||
+	    strstr(line, "Destination:") || strstr(line, "Merging formats")) {
+		struct dstr status = {0};
+		dstr_printf(&status, "%s\n%s", obs_module_text("StatusDownloading"), line);
+		set_download_progress(context, status.array);
+		dstr_free(&status);
+	}
+}
+
+static void read_progress_pipe(struct universal_media *context, struct dstr *output, os_process_pipe_t *pipe,
+			       bool error_stream)
+{
+	uint8_t buffer[4096];
+	size_t length;
+	struct dstr line = {0};
+
+	do {
+		length = error_stream ? os_process_pipe_read_err(pipe, buffer, sizeof(buffer))
+				      : os_process_pipe_read(pipe, buffer, sizeof(buffer));
+		if (!length)
+			continue;
+
+		dstr_ncat(output, (const char *)buffer, length);
+		for (size_t i = 0; i < length; i++) {
+			char ch = (char)buffer[i];
+			if (ch == '\r' || ch == '\n') {
+				update_progress_from_line(context, line.array);
+				dstr_free(&line);
+			} else {
+				dstr_ncat(&line, &ch, 1);
+			}
+		}
+	} while (length);
+
+	update_progress_from_line(context, line.array);
+	dstr_free(&line);
+}
+
 static bool is_media_url(const char *line)
 {
 	return strncmp(line, "http://", 7) == 0 || strncmp(line, "https://", 8) == 0 ||
@@ -407,6 +497,49 @@ static char *find_last_existing_path(const char *output)
 		while (*line == ' ' || *line == '\t')
 			line++;
 		if (*line && os_file_exists(line)) {
+			bfree(result);
+			result = bstrdup(line);
+		}
+		line = strtok(NULL, "\r\n");
+	}
+
+	bfree(copy);
+	return result;
+}
+
+static bool is_resolution_line(const char *line)
+{
+	bool saw_x = false;
+	bool saw_digit = false;
+
+	if (!line || !*line || strlen(line) > 32)
+		return false;
+
+	for (const char *ch = line; *ch; ch++) {
+		if (*ch >= '0' && *ch <= '9') {
+			saw_digit = true;
+		} else if (*ch == 'x' || *ch == 'X') {
+			if (saw_x)
+				return false;
+			saw_x = true;
+		} else {
+			return false;
+		}
+	}
+
+	return saw_digit && saw_x;
+}
+
+static char *find_last_resolution(const char *output)
+{
+	char *copy = bstrdup(output ? output : "");
+	char *line = strtok(copy, "\r\n");
+	char *result = NULL;
+
+	while (line) {
+		while (*line == ' ' || *line == '\t')
+			line++;
+		if (is_resolution_line(line)) {
 			bfree(result);
 			result = bstrdup(line);
 		}
@@ -561,7 +694,8 @@ static char *run_ytdlp(obs_data_t *settings, const char *format, struct dstr *er
 	return resolved;
 }
 
-static char *run_ytdlp_download(obs_data_t *settings, obs_source_t *source, struct dstr *error)
+static char *run_ytdlp_download(struct universal_media *context, obs_data_t *settings, obs_source_t *source,
+				struct dstr *error, char **resolution)
 {
 	const char *url = obs_data_get_string(settings, S_URL);
 	const char *uuid = obs_source_get_uuid(source);
@@ -598,6 +732,7 @@ static char *run_ytdlp_download(obs_data_t *settings, obs_source_t *source, stru
 	os_process_args_add_arg(args, "--no-warnings");
 	os_process_args_add_arg(args, "--no-playlist");
 	os_process_args_add_arg(args, "--no-js-runtimes");
+	os_process_args_add_arg(args, "--newline");
 	os_process_args_add_arg(args, "--force-overwrites");
 	os_process_args_add_arg(args, "--ffmpeg-location");
 	os_process_args_add_arg(args, ffmpeg_path);
@@ -605,6 +740,8 @@ static char *run_ytdlp_download(obs_data_t *settings, obs_source_t *source, stru
 	os_process_args_add_arg(args, "mp4");
 	os_process_args_add_arg(args, "--print");
 	os_process_args_add_arg(args, "after_move:filepath");
+	os_process_args_add_arg(args, "--print");
+	os_process_args_add_arg(args, "after_move:resolution");
 	os_process_args_add_arg(args, "--format");
 	os_process_args_add_arg(args, download_format(settings));
 	os_process_args_add_arg(args, "--output");
@@ -630,10 +767,12 @@ static char *run_ytdlp_download(obs_data_t *settings, obs_source_t *source, stru
 
 	struct dstr output = {0};
 	struct dstr error_output = {0};
+	read_progress_pipe(context, &error_output, pipe, true);
 	read_pipe(&output, pipe, false);
-	read_pipe(&error_output, pipe, true);
 	int exit_code = os_process_pipe_destroy(pipe);
 	char *downloaded = find_last_existing_path(output.array);
+	if (resolution)
+		*resolution = find_last_resolution(output.array);
 
 	if (!downloaded) {
 		struct dstr fallback = {0};
@@ -853,11 +992,116 @@ static char *prepare_input(struct universal_media *context, obs_data_t *settings
 
 		*is_local_file = true;
 		*used_engine = "yt-dlp download";
-		return run_ytdlp_download(settings, context->source, error);
+		return run_ytdlp_download(context, settings, context->source, error, NULL);
 	}
 
 	*is_local_file = false;
 	return resolve_url(settings, error, used_engine);
+}
+
+static char *download_key(obs_data_t *settings)
+{
+	struct dstr key = {0};
+	dstr_printf(&key, "%s\n%s\n%s\n%s\n%s", obs_data_get_string(settings, S_URL),
+		    obs_data_get_string(settings, S_QUALITY), obs_data_get_string(settings, S_FORMAT),
+		    obs_data_get_string(settings, S_STREAMLINK_STREAM), obs_data_get_string(settings, S_COOKIES));
+	return key.array;
+}
+
+static void *download_thread_main(void *param)
+{
+	struct universal_media *context = param;
+	os_set_thread_name("obs-universal-media-download");
+
+	obs_data_t *settings = NULL;
+	pthread_mutex_lock(&context->mutex);
+	settings = context->download_settings;
+	if (settings)
+		obs_data_addref(settings);
+	pthread_mutex_unlock(&context->mutex);
+
+	if (!settings) {
+		set_download_finished(context, false, NULL, obs_module_text("StatusDownloadFailed"));
+		return NULL;
+	}
+
+	struct dstr error = {0};
+	set_download_progress(context, obs_module_text("StatusDownloading"));
+	char *resolution = NULL;
+	char *result = run_ytdlp_download(context, settings, context->source, &error, &resolution);
+	pthread_mutex_lock(&context->mutex);
+	bfree(context->download_resolution);
+	context->download_resolution = resolution ? bstrdup(resolution) : NULL;
+	pthread_mutex_unlock(&context->mutex);
+	set_download_finished(context, result != NULL, result,
+			      result ? NULL : (error.array ? error.array : obs_module_text("StatusDownloadFailed")));
+
+	bfree(resolution);
+	bfree(result);
+	dstr_free(&error);
+	obs_data_release(settings);
+	return NULL;
+}
+
+static bool start_download_job(struct universal_media *context, obs_data_t *settings, struct dstr *error)
+{
+	if (is_likely_live_download(settings)) {
+		dstr_copy(error, obs_module_text("StatusDownloadLiveUnsupported"));
+		return false;
+	}
+
+	char *key = download_key(settings);
+	pthread_mutex_lock(&context->mutex);
+	bool running = context->download_running;
+	bool already_cached = context->cache_path && context->cache_key && strcmp(context->cache_key, key) == 0 &&
+			      os_file_exists(context->cache_path);
+	pthread_mutex_unlock(&context->mutex);
+
+	if (running || already_cached) {
+		bfree(key);
+		return true;
+	}
+
+	obs_data_t *settings_copy = obs_data_create();
+	obs_data_apply(settings_copy, settings);
+
+	pthread_mutex_lock(&context->mutex);
+	context->download_running = true;
+	context->download_complete = false;
+	context->download_success = false;
+	bfree(context->download_result);
+	context->download_result = NULL;
+	bfree(context->download_error);
+	context->download_error = NULL;
+	bfree(context->download_progress);
+	context->download_progress = bstrdup(obs_module_text("StatusDownloading"));
+	bfree(context->download_key);
+	context->download_key = key;
+	if (context->download_settings)
+		obs_data_release(context->download_settings);
+	context->download_settings = settings_copy;
+	pthread_mutex_unlock(&context->mutex);
+
+	if (pthread_create(&context->download_thread, NULL, download_thread_main, context) != 0) {
+		pthread_mutex_lock(&context->mutex);
+		context->download_running = false;
+		context->download_complete = true;
+		context->download_success = false;
+		bfree(context->download_error);
+		context->download_error = bstrdup(obs_module_text("StatusStartFailed"));
+		if (context->download_settings) {
+			obs_data_release(context->download_settings);
+			context->download_settings = NULL;
+		}
+		pthread_mutex_unlock(&context->mutex);
+		dstr_copy(error, obs_module_text("StatusStartFailed"));
+		return false;
+	}
+
+	pthread_mutex_lock(&context->mutex);
+	context->download_thread_active = true;
+	pthread_mutex_unlock(&context->mutex);
+	return true;
 }
 
 static void update_child(struct universal_media *context, obs_data_t *settings, const char *input,
@@ -912,10 +1156,24 @@ static void ump_update(void *data, obs_data_t *settings)
 	}
 
 	const char *playback_mode = obs_data_get_string(settings, S_PLAYBACK_MODE);
+	if (astrcmpi(playback_mode, PLAYBACK_DOWNLOAD) == 0) {
+		struct dstr error = {0};
+		if (start_download_job(context, settings, &error)) {
+			pthread_mutex_lock(&context->mutex);
+			const char *progress = context->download_progress ? context->download_progress
+									  : obs_module_text("StatusDownloading");
+			obs_data_set_string(settings, S_STATUS, progress);
+			pthread_mutex_unlock(&context->mutex);
+		} else {
+			obs_data_set_string(settings, S_STATUS,
+					    error.array ? error.array : obs_module_text("StatusDownloadFailed"));
+		}
+		dstr_free(&error);
+		return;
+	}
+
 	obs_data_set_string(settings, S_STATUS,
-			    astrcmpi(playback_mode, PLAYBACK_DOWNLOAD) == 0
-				    ? obs_module_text("StatusDownloading")
-				    : obs_module_text("StatusResolving"));
+			    obs_module_text("StatusResolving"));
 	struct dstr error = {0};
 	const char *used_engine = NULL;
 	bool is_local_file = false;
@@ -941,10 +1199,95 @@ static void ump_update(void *data, obs_data_t *settings)
 	dstr_free(&error);
 }
 
+static void ump_video_tick(void *data, float seconds)
+{
+	struct universal_media *context = data;
+	context->status_update_timer += seconds;
+
+	bool complete = false;
+	bool success = false;
+	bool thread_active = false;
+	char *progress = NULL;
+	char *result = NULL;
+	char *error = NULL;
+	char *key = NULL;
+	char *resolution = NULL;
+
+	pthread_mutex_lock(&context->mutex);
+	complete = context->download_complete;
+	success = context->download_success;
+	thread_active = context->download_thread_active;
+	if (context->download_progress)
+		progress = bstrdup(context->download_progress);
+	if (context->download_result)
+		result = bstrdup(context->download_result);
+	if (context->download_error)
+		error = bstrdup(context->download_error);
+	if (context->download_key)
+		key = bstrdup(context->download_key);
+	if (context->download_resolution)
+		resolution = bstrdup(context->download_resolution);
+	pthread_mutex_unlock(&context->mutex);
+
+	if (progress && context->status_update_timer >= 0.5f) {
+		obs_data_t *settings = obs_source_get_settings(context->source);
+		obs_data_set_string(settings, S_STATUS, progress);
+		obs_data_release(settings);
+		obs_source_update_properties(context->source);
+		context->status_update_timer = 0.0f;
+	}
+
+	if (complete) {
+		if (thread_active)
+			pthread_join(context->download_thread, NULL);
+
+		obs_data_t *settings = obs_source_get_settings(context->source);
+		if (success && result) {
+			bfree(context->resolved_by);
+			context->resolved_by = bstrdup("yt-dlp download");
+			bfree(context->cache_path);
+			context->cache_path = bstrdup(result);
+			bfree(context->cache_key);
+			context->cache_key = key ? bstrdup(key) : NULL;
+			bfree(context->cache_resolution);
+			context->cache_resolution = resolution ? bstrdup(resolution) : NULL;
+			update_child(context, settings, result, true);
+			if (obs_data_get_bool(settings, S_AUTO_FIT))
+				apply_scaling(context, SCALE_FIT);
+			update_source_info(context, settings);
+			obs_data_set_string(settings, S_STATUS, obs_module_text("StatusReady"));
+			blog(LOG_INFO, "[Universal Media Player] Download/remux completed successfully");
+		} else {
+			obs_data_set_string(settings, S_STATUS,
+					    error && *error ? error : obs_module_text("StatusDownloadFailed"));
+			blog(LOG_ERROR, "[Universal Media Player] %s",
+			     error && *error ? error : obs_module_text("StatusDownloadFailed"));
+		}
+		obs_data_release(settings);
+		obs_source_update_properties(context->source);
+
+		pthread_mutex_lock(&context->mutex);
+		context->download_complete = false;
+		context->download_thread_active = false;
+		if (context->download_settings) {
+			obs_data_release(context->download_settings);
+			context->download_settings = NULL;
+		}
+		pthread_mutex_unlock(&context->mutex);
+	}
+
+	bfree(progress);
+	bfree(result);
+	bfree(error);
+	bfree(key);
+	bfree(resolution);
+}
+
 static void *ump_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct universal_media *context = bzalloc(sizeof(*context));
 	context->source = source;
+	pthread_mutex_init(&context->mutex, NULL);
 	ump_update(context, settings);
 	return context;
 }
@@ -952,11 +1295,30 @@ static void *ump_create(obs_data_t *settings, obs_source_t *source)
 static void ump_destroy(void *data)
 {
 	struct universal_media *context = data;
+	pthread_mutex_lock(&context->mutex);
+	bool thread_active = context->download_thread_active;
+	pthread_mutex_unlock(&context->mutex);
+	if (thread_active) {
+#ifdef _WIN32
+		terminate_bundled_process_tree();
+#endif
+		pthread_join(context->download_thread, NULL);
+	}
 	if (context->media && context->active)
 		obs_source_remove_active_child(context->source, context->media);
 	obs_source_release(context->media);
 	bfree(context->resolved_by);
 	bfree(context->cache_path);
+	bfree(context->cache_key);
+	bfree(context->cache_resolution);
+	bfree(context->download_result);
+	bfree(context->download_error);
+	bfree(context->download_progress);
+	bfree(context->download_key);
+	bfree(context->download_resolution);
+	if (context->download_settings)
+		obs_data_release(context->download_settings);
+	pthread_mutex_destroy(&context->mutex);
 	bfree(context);
 }
 
@@ -1387,6 +1749,7 @@ struct obs_source_info universal_media_source_info = {
 	.update = ump_update,
 	.activate = ump_activate,
 	.deactivate = ump_deactivate,
+	.video_tick = ump_video_tick,
 	.video_render = ump_render,
 	.audio_render = ump_audio_render,
 	.get_width = ump_width,
