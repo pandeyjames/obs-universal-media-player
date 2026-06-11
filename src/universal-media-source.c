@@ -8,6 +8,7 @@
 
 #define S_URL "url"
 #define S_PROVIDER "provider"
+#define S_PLAYBACK_MODE "playback_mode"
 #define S_ENGINE "resolver_engine"
 #define S_RESOLVE "resolve_with_ytdlp"
 #define S_QUALITY "quality"
@@ -37,10 +38,14 @@
 #define ENGINE_STREAMLINK "streamlink"
 #define ENGINE_DIRECT "direct"
 
+#define PLAYBACK_STREAM "stream"
+#define PLAYBACK_DOWNLOAD "download"
+
 struct universal_media {
 	obs_source_t *source;
 	obs_source_t *media;
 	char *resolved_by;
+	char *cache_path;
 	bool active;
 };
 
@@ -74,6 +79,7 @@ static void update_source_info(struct universal_media *context, obs_data_t *sett
 	const char *provider = obs_data_get_string(settings, S_PROVIDER);
 	const char *engine = context && context->resolved_by ? context->resolved_by
 							     : obs_data_get_string(settings, S_ENGINE);
+	const char *playback_mode = obs_data_get_string(settings, S_PLAYBACK_MODE);
 	uint32_t width = context && context->media ? obs_source_get_width(context->media) : 0;
 	uint32_t height = context && context->media ? obs_source_get_height(context->media) : 0;
 	int64_t duration = context && context->media ? obs_source_media_get_duration(context->media) : 0;
@@ -82,9 +88,12 @@ static void update_source_info(struct universal_media *context, obs_data_t *sett
 
 	struct dstr info = {0};
 	dstr_printf(&info,
-		    "%s: %s\n%s: %s\n%s: %ux%u\n%s: %ux%u\n%s: %s\n%s: ",
+		    "%s: %s\n%s: %s\n%s: %s\n%s: %ux%u\n%s: %ux%u\n%s: %s\n%s: ",
 		    obs_module_text("InfoProvider"), provider && *provider ? provider : "auto",
 		    obs_module_text("InfoResolver"), engine && *engine ? engine : "auto",
+		    obs_module_text("InfoPlaybackMode"),
+		    astrcmpi(playback_mode, PLAYBACK_DOWNLOAD) == 0 ? obs_module_text("PlaybackDownload")
+								    : obs_module_text("PlaybackStream"),
 		    obs_module_text("InfoMediaSize"), width, height, obs_module_text("InfoCanvasSize"),
 		    ovi.base_width, ovi.base_height, obs_module_text("InfoMediaState"), media_state_name(state),
 		    obs_module_text("InfoDuration"));
@@ -96,6 +105,9 @@ static void update_source_info(struct universal_media *context, obs_data_t *sett
 	} else {
 		dstr_cat(&info, obs_module_text("InfoLiveUnknown"));
 	}
+
+	if (context && context->cache_path && *context->cache_path)
+		dstr_catf(&info, "\n%s: %s", obs_module_text("InfoCachedFile"), context->cache_path);
 
 	obs_data_set_string(settings, S_SOURCE_INFO, info.array);
 	dstr_free(&info);
@@ -215,6 +227,26 @@ static char *find_last_media_url(const char *output)
 	return result;
 }
 
+static char *find_last_existing_path(const char *output)
+{
+	char *copy = bstrdup(output ? output : "");
+	char *line = strtok(copy, "\r\n");
+	char *result = NULL;
+
+	while (line) {
+		while (*line == ' ' || *line == '\t')
+			line++;
+		if (*line && os_file_exists(line)) {
+			bfree(result);
+			result = bstrdup(line);
+		}
+		line = strtok(NULL, "\r\n");
+	}
+
+	bfree(copy);
+	return result;
+}
+
 static const char *quality_format(obs_data_t *settings)
 {
 	const char *quality = obs_data_get_string(settings, S_QUALITY);
@@ -235,6 +267,72 @@ static const char *quality_format(obs_data_t *settings)
 		return custom && *custom ? custom : "best";
 	}
 	return "best";
+}
+
+static const char *download_format(obs_data_t *settings)
+{
+	const char *quality = obs_data_get_string(settings, S_QUALITY);
+	if (astrcmpi(quality, "2160") == 0)
+		return "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160]/best";
+	if (astrcmpi(quality, "1440") == 0)
+		return "bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1440]+bestaudio/best[height<=1440]/best";
+	if (astrcmpi(quality, "1080") == 0)
+		return "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best";
+	if (astrcmpi(quality, "720") == 0)
+		return "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best";
+	if (astrcmpi(quality, "480") == 0)
+		return "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best";
+	if (astrcmpi(quality, "360") == 0)
+		return "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/best";
+	if (astrcmpi(quality, "custom") == 0) {
+		const char *custom = obs_data_get_string(settings, S_FORMAT);
+		return custom && *custom ? custom : "bestvideo+bestaudio/best";
+	}
+	return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best";
+}
+
+static char *cache_directory(struct dstr *error)
+{
+	char *dir = obs_module_config_path("cache");
+	if (!dir) {
+		dstr_copy(error, obs_module_text("StatusCachePathFailed"));
+		return NULL;
+	}
+
+	if (os_mkdirs(dir) == MKDIR_ERROR) {
+		dstr_copy(error, obs_module_text("StatusCachePathFailed"));
+		bfree(dir);
+		return NULL;
+	}
+
+	return dir;
+}
+
+static void clear_download_cache(const char *uuid)
+{
+	if (!uuid || !*uuid)
+		return;
+
+	struct dstr error = {0};
+	char *dir = cache_directory(&error);
+	dstr_free(&error);
+	if (!dir)
+		return;
+
+	struct dstr pattern = {0};
+	dstr_printf(&pattern, "%s/%s.*", dir, uuid);
+
+	os_glob_t *glob = NULL;
+	if (os_glob(pattern.array, 0, &glob) == 0) {
+		for (size_t i = 0; i < glob->gl_pathc; i++) {
+			if (!glob->gl_pathv[i].directory)
+				os_unlink(glob->gl_pathv[i].path);
+		}
+		os_globfree(glob);
+	}
+
+	dstr_free(&pattern);
+	bfree(dir);
 }
 
 static char *run_ytdlp(obs_data_t *settings, const char *format, struct dstr *error)
@@ -291,6 +389,127 @@ static char *run_ytdlp(obs_data_t *settings, const char *format, struct dstr *er
 	dstr_free(&output);
 	dstr_free(&error_output);
 	return resolved;
+}
+
+static char *run_ytdlp_download(obs_data_t *settings, obs_source_t *source, struct dstr *error)
+{
+	const char *url = obs_data_get_string(settings, S_URL);
+	const char *uuid = obs_source_get_uuid(source);
+	char *ytdlp_path = obs_module_file("bin/yt-dlp.exe");
+	if (!ytdlp_path || !os_file_exists(ytdlp_path)) {
+		dstr_copy(error, obs_module_text("StatusMissingYtDlp"));
+		bfree(ytdlp_path);
+		return NULL;
+	}
+
+	char *ffmpeg_path = obs_module_file("bin/streamlink/ffmpeg");
+	if (!ffmpeg_path || !os_file_exists(ffmpeg_path)) {
+		dstr_copy(error, obs_module_text("StatusMissingFfmpeg"));
+		bfree(ytdlp_path);
+		bfree(ffmpeg_path);
+		return NULL;
+	}
+
+	char *dir = cache_directory(error);
+	if (!dir) {
+		bfree(ytdlp_path);
+		bfree(ffmpeg_path);
+		return NULL;
+	}
+
+	clear_download_cache(uuid);
+
+	struct dstr output_template = {0};
+	dstr_printf(&output_template, "%s/%s.%%(ext)s", dir, uuid);
+
+	const char *cookies = obs_data_get_string(settings, S_COOKIES);
+	os_process_args_t *args = os_process_args_create(ytdlp_path);
+	os_process_args_add_arg(args, "--ignore-config");
+	os_process_args_add_arg(args, "--no-warnings");
+	os_process_args_add_arg(args, "--no-playlist");
+	os_process_args_add_arg(args, "--no-js-runtimes");
+	os_process_args_add_arg(args, "--force-overwrites");
+	os_process_args_add_arg(args, "--ffmpeg-location");
+	os_process_args_add_arg(args, ffmpeg_path);
+	os_process_args_add_arg(args, "--merge-output-format");
+	os_process_args_add_arg(args, "mp4");
+	os_process_args_add_arg(args, "--print");
+	os_process_args_add_arg(args, "after_move:filepath");
+	os_process_args_add_arg(args, "--format");
+	os_process_args_add_arg(args, download_format(settings));
+	os_process_args_add_arg(args, "--output");
+	os_process_args_add_arg(args, output_template.array);
+
+	if (cookies && *cookies && astrcmpi(cookies, "none") != 0) {
+		os_process_args_add_arg(args, "--cookies-from-browser");
+		os_process_args_add_arg(args, cookies);
+	}
+
+	os_process_args_add_arg(args, url);
+	os_process_pipe_t *pipe = os_process_pipe_create2(args, "r");
+	os_process_args_destroy(args);
+	bfree(ytdlp_path);
+	bfree(ffmpeg_path);
+
+	if (!pipe) {
+		dstr_copy(error, obs_module_text("StatusStartFailed"));
+		dstr_free(&output_template);
+		bfree(dir);
+		return NULL;
+	}
+
+	struct dstr output = {0};
+	struct dstr error_output = {0};
+	read_pipe(&output, pipe, false);
+	read_pipe(&error_output, pipe, true);
+	int exit_code = os_process_pipe_destroy(pipe);
+	char *downloaded = find_last_existing_path(output.array);
+
+	if (!downloaded) {
+		struct dstr fallback = {0};
+		dstr_printf(&fallback, "%s/%s.mp4", dir, uuid);
+		if (os_file_exists(fallback.array))
+			downloaded = bstrdup(fallback.array);
+		dstr_free(&fallback);
+	}
+
+	if (!downloaded) {
+		if (error_output.len)
+			dstr_copy_dstr(error, &error_output);
+		else if (output.len)
+			dstr_copy_dstr(error, &output);
+		else
+			dstr_printf(error, "%s (%d)", obs_module_text("StatusDownloadFailed"), exit_code);
+	}
+
+	dstr_free(&output);
+	dstr_free(&error_output);
+	dstr_free(&output_template);
+	bfree(dir);
+	return downloaded;
+}
+
+static bool is_likely_live_download(obs_data_t *settings)
+{
+	const char *provider = obs_data_get_string(settings, S_PROVIDER);
+	const char *url = obs_data_get_string(settings, S_URL);
+
+	if (!url || !*url)
+		return false;
+
+	if (astrcmpi(provider, "twitch") == 0 || strstr(url, "twitch.tv/")) {
+		return !strstr(url, "/videos/") && !strstr(url, "/clip/") && !strstr(url, "/clips/");
+	}
+
+	if (astrcmpi(provider, "kick") == 0 || strstr(url, "kick.com/")) {
+		return !strstr(url, "/video/") && !strstr(url, "/videos/") && !strstr(url, "/clip/");
+	}
+
+	if (astrcmpi(provider, "youtube") == 0 || strstr(url, "youtube.com/") || strstr(url, "youtu.be/")) {
+		return strstr(url, "youtube.com/live/") || strstr(url, "youtu.be/live/");
+	}
+
+	return false;
 }
 
 static const char *streamlink_limit(obs_data_t *settings)
@@ -446,18 +665,50 @@ static char *resolve_url(obs_data_t *settings, struct dstr *error, const char **
 	return resolved;
 }
 
-static void update_child(struct universal_media *context, obs_data_t *settings, const char *input)
+static char *prepare_input(struct universal_media *context, obs_data_t *settings, struct dstr *error,
+			   const char **used_engine, bool *is_local_file)
+{
+	const char *url = obs_data_get_string(settings, S_URL);
+	if (!url || !*url) {
+		dstr_copy(error, obs_module_text("StatusEmptyUrl"));
+		return NULL;
+	}
+
+	const char *playback_mode = obs_data_get_string(settings, S_PLAYBACK_MODE);
+	if (astrcmpi(playback_mode, PLAYBACK_DOWNLOAD) == 0) {
+		if (is_likely_live_download(settings)) {
+			dstr_copy(error, obs_module_text("StatusDownloadLiveUnsupported"));
+			return NULL;
+		}
+
+		*is_local_file = true;
+		*used_engine = "yt-dlp download";
+		return run_ytdlp_download(settings, context->source, error);
+	}
+
+	*is_local_file = false;
+	return resolve_url(settings, error, used_engine);
+}
+
+static void update_child(struct universal_media *context, obs_data_t *settings, const char *input,
+			 bool is_local_file)
 {
 	obs_data_t *child_settings = obs_data_create();
-	obs_data_set_bool(child_settings, "is_local_file", false);
-	obs_data_set_string(child_settings, "input", input);
+	obs_data_set_bool(child_settings, "is_local_file", is_local_file);
+	if (is_local_file) {
+		obs_data_set_string(child_settings, "local_file", input);
+		obs_data_set_string(child_settings, "input", "");
+	} else {
+		obs_data_set_string(child_settings, "input", input);
+		obs_data_set_string(child_settings, "local_file", "");
+	}
 	obs_data_set_string(child_settings, "input_format", "");
 	obs_data_set_bool(child_settings, "looping", obs_data_get_bool(settings, S_LOOP));
 	obs_data_set_bool(child_settings, "hw_decode", obs_data_get_bool(settings, S_HW_DECODE));
 	obs_data_set_bool(child_settings, "close_when_inactive",
-			  obs_data_get_bool(settings, S_CLOSE_INACTIVE));
+			  is_local_file ? false : obs_data_get_bool(settings, S_CLOSE_INACTIVE));
 	obs_data_set_bool(child_settings, "restart_on_activate",
-			  obs_data_get_bool(settings, S_RESTART_ACTIVE));
+			  is_local_file ? false : obs_data_get_bool(settings, S_RESTART_ACTIVE));
 	obs_data_set_bool(child_settings, "clear_on_media_end", obs_data_get_bool(settings, S_CLEAR_END));
 	obs_data_set_int(child_settings, "buffering_mb", obs_data_get_int(settings, S_BUFFERING));
 	obs_data_set_int(child_settings, "reconnect_delay_sec",
@@ -490,14 +741,21 @@ static void ump_update(void *data, obs_data_t *settings)
 		return;
 	}
 
-	obs_data_set_string(settings, S_STATUS, obs_module_text("StatusResolving"));
+	const char *playback_mode = obs_data_get_string(settings, S_PLAYBACK_MODE);
+	obs_data_set_string(settings, S_STATUS,
+			    astrcmpi(playback_mode, PLAYBACK_DOWNLOAD) == 0
+				    ? obs_module_text("StatusDownloading")
+				    : obs_module_text("StatusResolving"));
 	struct dstr error = {0};
 	const char *used_engine = NULL;
-	char *resolved = resolve_url(settings, &error, &used_engine);
+	bool is_local_file = false;
+	char *resolved = prepare_input(context, settings, &error, &used_engine, &is_local_file);
 	if (resolved) {
 		bfree(context->resolved_by);
 		context->resolved_by = bstrdup(used_engine ? used_engine : ENGINE_DIRECT);
-		update_child(context, settings, resolved);
+		bfree(context->cache_path);
+		context->cache_path = is_local_file ? bstrdup(resolved) : NULL;
+		update_child(context, settings, resolved, is_local_file);
 		if (obs_data_get_bool(settings, S_AUTO_FIT))
 			apply_scaling(context, SCALE_FIT);
 		update_source_info(context, settings);
@@ -528,6 +786,7 @@ static void ump_destroy(void *data)
 		obs_source_remove_active_child(context->source, context->media);
 	obs_source_release(context->media);
 	bfree(context->resolved_by);
+	bfree(context->cache_path);
 	bfree(context);
 }
 
@@ -639,6 +898,25 @@ static bool source_info_clicked(obs_properties_t *properties, obs_property_t *pr
 	return true;
 }
 
+static bool clear_cache_clicked(obs_properties_t *properties, obs_property_t *property, void *data)
+{
+	struct universal_media *context = data;
+	UNUSED_PARAMETER(properties);
+	UNUSED_PARAMETER(property);
+	if (!context)
+		return false;
+
+	clear_download_cache(obs_source_get_uuid(context->source));
+	bfree(context->cache_path);
+	context->cache_path = NULL;
+
+	obs_data_t *settings = obs_source_get_settings(context->source);
+	obs_data_set_string(settings, S_STATUS, obs_module_text("StatusCacheCleared"));
+	update_source_info(context, settings);
+	obs_data_release(settings);
+	return true;
+}
+
 static bool scaling_clicked(obs_properties_t *properties, obs_property_t *property, void *data)
 {
 	struct universal_media *context = data;
@@ -698,18 +976,29 @@ static const char *provider_guidance(const char *provider)
 static void update_resolver_visibility(obs_properties_t *properties, obs_data_t *settings)
 {
 	const char *provider = obs_data_get_string(settings, S_PROVIDER);
+	const char *playback_mode = obs_data_get_string(settings, S_PLAYBACK_MODE);
 	const char *engine = obs_data_get_string(settings, S_ENGINE);
+	const bool download = astrcmpi(playback_mode, PLAYBACK_DOWNLOAD) == 0;
 	const bool direct = astrcmpi(provider, "direct") == 0 || astrcmpi(engine, ENGINE_DIRECT) == 0;
 	const bool streamlink = astrcmpi(engine, ENGINE_STREAMLINK) == 0;
 	const bool ytdlp = astrcmpi(engine, ENGINE_YTDLP) == 0;
 	const bool custom = astrcmpi(obs_data_get_string(settings, S_QUALITY), "custom") == 0;
 
-	obs_property_set_visible(obs_properties_get(properties, S_RESOLVE), !direct);
-	obs_property_set_visible(obs_properties_get(properties, S_QUALITY), !direct);
-	obs_property_set_visible(obs_properties_get(properties, S_COOKIES), !direct && !streamlink);
-	obs_property_set_visible(obs_properties_get(properties, S_FORMAT), !direct && !streamlink && custom);
+	obs_property_set_visible(obs_properties_get(properties, S_ENGINE), !download);
+	obs_property_set_visible(obs_properties_get(properties, S_RESOLVE), !direct && !download);
+	obs_property_set_visible(obs_properties_get(properties, S_QUALITY), !direct || download);
+	obs_property_set_visible(obs_properties_get(properties, S_COOKIES), (!direct && !streamlink) || download);
+	obs_property_set_visible(obs_properties_get(properties, S_FORMAT),
+				 ((!direct && !streamlink) || download) && custom);
 	obs_property_set_visible(obs_properties_get(properties, S_STREAMLINK_STREAM),
-				 !direct && !ytdlp && custom);
+				 !download && !direct && !ytdlp && custom);
+}
+
+static bool playback_modified(obs_properties_t *properties, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(property);
+	update_resolver_visibility(properties, settings);
+	return true;
 }
 
 static bool provider_modified(obs_properties_t *properties, obs_property_t *property, obs_data_t *settings)
@@ -772,6 +1061,14 @@ static obs_properties_t *ump_properties(void *data)
 	obs_properties_add_text(properties, S_GUIDANCE, provider_guidance("auto"), OBS_TEXT_INFO);
 	obs_properties_add_text(properties, S_URL, obs_module_text("MediaUrl"), OBS_TEXT_DEFAULT);
 
+	obs_property_t *playback_modes = obs_properties_add_list(properties, S_PLAYBACK_MODE,
+								obs_module_text("PlaybackMode"),
+								OBS_COMBO_TYPE_LIST,
+								OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(playback_modes, obs_module_text("PlaybackStream"), PLAYBACK_STREAM);
+	obs_property_list_add_string(playback_modes, obs_module_text("PlaybackDownload"), PLAYBACK_DOWNLOAD);
+	obs_property_set_modified_callback(playback_modes, playback_modified);
+
 	obs_property_t *engines = obs_properties_add_list(properties, S_ENGINE, obs_module_text("ResolverEngine"),
 							 OBS_COMBO_TYPE_LIST,
 							 OBS_COMBO_FORMAT_STRING);
@@ -824,6 +1121,8 @@ static obs_properties_t *ump_properties(void *data)
 	obs_properties_add_text(properties, S_SOURCE_INFO, obs_module_text("SourceInformation"), OBS_TEXT_INFO);
 	obs_properties_add_button2(properties, "refresh_source_info", obs_module_text("RefreshSourceInformation"),
 				   source_info_clicked, data);
+	obs_properties_add_button2(properties, "clear_download_cache", obs_module_text("ClearDownloadCache"),
+				   clear_cache_clicked, data);
 
 	obs_property_t *scaling =
 		obs_properties_add_list(properties, S_SCALING_MODE, obs_module_text("CanvasScaling"),
@@ -841,6 +1140,7 @@ static obs_properties_t *ump_properties(void *data)
 static void ump_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, S_PROVIDER, "auto");
+	obs_data_set_default_string(settings, S_PLAYBACK_MODE, PLAYBACK_STREAM);
 	obs_data_set_default_string(settings, S_ENGINE, ENGINE_AUTO);
 	obs_data_set_default_bool(settings, S_RESOLVE, true);
 	obs_data_set_default_string(settings, S_QUALITY, "best");

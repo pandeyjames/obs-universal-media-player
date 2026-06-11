@@ -29,6 +29,29 @@ The provider dropdown displays link guidance. **Best compatible** is the
 recommended quality setting. If a selected resolution is unavailable, the
 plugin automatically retries the best format offered by the service.
 
+## Playback modes
+
+- **Stream immediately** resolves a URL and starts playback as soon as OBS can
+  open the stream. This is best for live streams and quick playback.
+- **Download/remux high quality** uses yt-dlp to download the best matching
+  video track and best audio track, merges them with bundled FFmpeg, then plays
+  the resulting local file through the same OBS source. This is best for normal
+  videos, VODs, and clips where 1080p or higher is split into separate video and
+  audio streams.
+
+Download/remux mode still appears as one OBS source. The separate video and
+audio tracks exist only while yt-dlp and FFmpeg are preparing the file. Once
+complete, OBS receives one local media file with video and audio together, so
+media controls, audio mixing, transforms, and source visibility stay unified.
+
+The preview can stay blank while download/remux is running. For long VODs, this
+can take a long time because the entire video must be downloaded and merged
+before OBS can open the completed local file.
+
+Do not use download/remux mode for live streams. A live stream has no fixed end,
+so the merged file cannot be completed before playback. Use Streamlink or Direct
+URL mode for live HLS/RTMP/SRT sources.
+
 ## Resolver engines
 
 - **Auto** prefers Streamlink for Twitch and Kick live URLs and yt-dlp for
@@ -51,10 +74,15 @@ URLs.
 ```text
 OBS Add Source
   -> universal_media_player source
-      -> resolver engine
-          -> direct URL bypass
-          -> yt-dlp --get-url
-          -> Streamlink --stream-url
+      -> playback mode
+          -> stream immediately
+              -> direct URL bypass
+              -> yt-dlp --get-url
+              -> Streamlink --stream-url
+          -> download/remux high quality
+              -> yt-dlp bestvideo+bestaudio
+              -> bundled FFmpeg merge/remux
+              -> local cache file
       -> private OBS ffmpeg_source
           -> OBS video renderer
           -> OBS audio mixer
@@ -72,7 +100,9 @@ rendering through its native media pipeline.
 
 ### Resolver Layer
 
-The resolver layer runs external tools as short-lived child processes:
+The resolver layer runs external tools as short-lived child processes.
+
+Immediate streaming uses:
 
 - `yt-dlp.exe --get-url` for broad website, VOD, clip, and audio support
 - `streamlink.exe --stream-url` for live-stream focused providers
@@ -81,6 +111,17 @@ The resolver layer runs external tools as short-lived child processes:
 Auto mode chooses a preferred resolver based on the provider and URL, then tries
 the other resolver if the first one fails. The resolved URL is passed to the
 private OBS Media Source as its input.
+
+High-quality download/remux mode uses yt-dlp's split-stream format selection:
+
+```text
+bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best
+```
+
+The selected video and audio streams are merged by bundled FFmpeg into the
+plugin cache folder, then the private OBS Media Source opens that local file.
+This is the mode to use when YouTube or another provider only exposes 1080p+
+quality as separate video-only and audio-only streams.
 
 ### Bundled Dependencies
 
@@ -132,7 +173,9 @@ The plugin selects a single stream containing both video and audio because one
 native OBS Media Source accepts one input URL. Some services, especially
 YouTube, offer their highest resolutions only as separate video and audio
 streams. In that case the plugin falls back to the best compatible combined
-stream so preview and playback remain reliable.
+stream in **Stream immediately** mode. Use **Download/remux high quality** when
+you want yt-dlp and FFmpeg to merge those separate streams into one local file
+for higher quality playback.
 
 ## Source information and canvas scaling
 
@@ -160,6 +203,10 @@ For Twitch and other live HLS sources, keep these options disabled:
 - Clear frame when playback ends
 
 Use **Resolve / Refresh Stream** when a signed stream URL expires.
+
+Use **Stream immediately** for live streams. Download/remux mode is intentionally
+for finite videos and VODs because live streams do not produce a complete file
+that can be handed to OBS.
 
 ## Limitations
 
