@@ -6,6 +6,13 @@
 #include <util/pipe.h>
 #include <util/platform.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <tlhelp32.h>
+#include <wchar.h>
+#endif
+
 #define S_URL "url"
 #define S_PROVIDER "provider"
 #define S_PLAYBACK_MODE "playback_mode"
@@ -48,6 +55,169 @@ struct universal_media {
 	char *cache_path;
 	bool active;
 };
+
+#ifdef _WIN32
+struct os_process_pipe_windows {
+	bool read_pipe;
+	HANDLE handle;
+	HANDLE handle_err;
+	HANDLE process;
+};
+
+static HANDLE resolver_job;
+
+static void normalize_path(char *path)
+{
+	for (char *ch = path; ch && *ch; ch++) {
+		if (*ch == '\\')
+			*ch = '/';
+		else if (*ch >= 'A' && *ch <= 'Z')
+			*ch = (char)(*ch - 'A' + 'a');
+	}
+}
+
+static char *bundled_bin_directory(void)
+{
+	char *dir = obs_module_file("bin");
+	if (dir)
+		normalize_path(dir);
+	return dir;
+}
+
+static bool process_path_in_bundled_bin(DWORD process_id, const char *bin_dir)
+{
+	HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id);
+	if (!process)
+		return false;
+
+	wchar_t wide_path[MAX_PATH * 4];
+	DWORD size = (DWORD)(sizeof(wide_path) / sizeof(wide_path[0]));
+	bool match = false;
+
+	if (QueryFullProcessImageNameW(process, 0, wide_path, &size)) {
+		char *path = NULL;
+		if (os_wcs_to_utf8_ptr(wide_path, 0, &path) && path) {
+			normalize_path(path);
+			match = strncmp(path, bin_dir, strlen(bin_dir)) == 0 &&
+				(path[strlen(bin_dir)] == '/' || path[strlen(bin_dir)] == '\0');
+			bfree(path);
+		}
+	}
+
+	CloseHandle(process);
+	return match;
+}
+
+static void terminate_bundled_process_tree(void)
+{
+	char *bin_dir = bundled_bin_directory();
+	if (!bin_dir)
+		return;
+
+	DWORD current_process = GetCurrentProcessId();
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		bfree(bin_dir);
+		return;
+	}
+
+	PROCESSENTRY32W entry = {0};
+	entry.dwSize = sizeof(entry);
+
+	if (Process32FirstW(snapshot, &entry)) {
+		do {
+			if (entry.th32ProcessID == current_process)
+				continue;
+
+			if (!process_path_in_bundled_bin(entry.th32ProcessID, bin_dir))
+				continue;
+
+			HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+						     false, entry.th32ProcessID);
+			if (process) {
+				blog(LOG_INFO,
+				     "[Universal Media Player] Terminating stale bundled process %lu",
+				     (unsigned long)entry.th32ProcessID);
+				TerminateProcess(process, 1);
+				CloseHandle(process);
+			}
+		} while (Process32NextW(snapshot, &entry));
+	}
+
+	CloseHandle(snapshot);
+	bfree(bin_dir);
+}
+
+static bool ensure_resolver_job(void)
+{
+	if (resolver_job)
+		return true;
+
+	resolver_job = CreateJobObjectW(NULL, NULL);
+	if (!resolver_job) {
+		blog(LOG_WARNING, "[Universal Media Player] Could not create resolver cleanup job: %lu",
+		     GetLastError());
+		return false;
+	}
+
+	JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+	limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+	if (!SetInformationJobObject(resolver_job, JobObjectExtendedLimitInformation, &limits,
+				     sizeof(limits))) {
+		blog(LOG_WARNING, "[Universal Media Player] Could not configure resolver cleanup job: %lu",
+		     GetLastError());
+		CloseHandle(resolver_job);
+		resolver_job = NULL;
+		return false;
+	}
+
+	return true;
+}
+
+static void assign_pipe_to_cleanup_job(os_process_pipe_t *pipe)
+{
+	if (!pipe || !ensure_resolver_job())
+		return;
+
+	struct os_process_pipe_windows *windows_pipe = (struct os_process_pipe_windows *)pipe;
+	if (!AssignProcessToJobObject(resolver_job, windows_pipe->process)) {
+		DWORD error = GetLastError();
+		if (error != ERROR_ACCESS_DENIED)
+			blog(LOG_WARNING,
+			     "[Universal Media Player] Could not assign resolver process to cleanup job: %lu",
+			     error);
+	}
+}
+#endif
+
+void universal_media_init_process_cleanup(void)
+{
+#ifdef _WIN32
+	terminate_bundled_process_tree();
+	ensure_resolver_job();
+#endif
+}
+
+void universal_media_terminate_bundled_processes(void)
+{
+#ifdef _WIN32
+	if (resolver_job) {
+		CloseHandle(resolver_job);
+		resolver_job = NULL;
+	}
+
+	terminate_bundled_process_tree();
+#endif
+}
+
+static os_process_pipe_t *create_managed_process_pipe(const os_process_args_t *args, const char *type)
+{
+	os_process_pipe_t *pipe = os_process_pipe_create2(args, type);
+#ifdef _WIN32
+	assign_pipe_to_cleanup_job(pipe);
+#endif
+	return pipe;
+}
 
 static const char *media_state_name(enum obs_media_state state)
 {
@@ -361,7 +531,7 @@ static char *run_ytdlp(obs_data_t *settings, const char *format, struct dstr *er
 	}
 
 	os_process_args_add_arg(args, url);
-	os_process_pipe_t *pipe = os_process_pipe_create2(args, "r");
+	os_process_pipe_t *pipe = create_managed_process_pipe(args, "r");
 	os_process_args_destroy(args);
 	bfree(ytdlp_path);
 
@@ -446,7 +616,7 @@ static char *run_ytdlp_download(obs_data_t *settings, obs_source_t *source, stru
 	}
 
 	os_process_args_add_arg(args, url);
-	os_process_pipe_t *pipe = os_process_pipe_create2(args, "r");
+	os_process_pipe_t *pipe = create_managed_process_pipe(args, "r");
 	os_process_args_destroy(args);
 	bfree(ytdlp_path);
 	bfree(ffmpeg_path);
@@ -563,7 +733,7 @@ static char *run_streamlink(obs_data_t *settings, struct dstr *error)
 
 	os_process_args_add_arg(args, url);
 	os_process_args_add_arg(args, stream);
-	os_process_pipe_t *pipe = os_process_pipe_create2(args, "r");
+	os_process_pipe_t *pipe = create_managed_process_pipe(args, "r");
 	os_process_args_destroy(args);
 	bfree(streamlink_path);
 

@@ -48,6 +48,12 @@ The preview can stay blank while download/remux is running. For long VODs, this
 can take a long time because the entire video must be downloaded and merged
 before OBS can open the completed local file.
 
+Resolver and remux processes started from the bundled `yt-dlp`, Streamlink, and
+FFmpeg runtime are attached to the OBS process on Windows. If OBS exits or is
+terminated, Windows also terminates that bundled process tree. On the next
+plugin load, the plugin cleans up any stale bundled resolver processes left by
+older builds.
+
 Do not use download/remux mode for live streams. A live stream has no fixed end,
 so the merged file cannot be completed before playback. Use Streamlink or Direct
 URL mode for live HLS/RTMP/SRT sources.
@@ -88,6 +94,8 @@ OBS Add Source
           -> OBS audio mixer
       -> scene item transform controls
           -> fit / stretch / center / reset on the active scene
+      -> bundled process cleanup
+          -> Windows job object terminates yt-dlp, Streamlink, and FFmpeg with OBS
 ```
 
 ### Source Layer
@@ -130,6 +138,11 @@ Streamlink runtime. The Git repository does not commit generated third-party
 executables. Instead, `scripts/fetch-windows-dependencies.ps1` downloads the
 pinned artifacts and verifies SHA-256 hashes before placing them under
 `data/bin`.
+
+On Windows, every bundled resolver process launched by the plugin is assigned
+to a cleanup job owned by OBS. Closing or terminating OBS closes that job and
+kills the bundled resolver process tree, including FFmpeg children spawned by
+yt-dlp.
 
 ### Playback And Transforms
 

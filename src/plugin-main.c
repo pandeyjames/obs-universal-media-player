@@ -13,6 +13,7 @@ MODULE_EXPORT const char *obs_module_description(void)
 
 bool obs_module_load(void)
 {
+	universal_media_init_process_cleanup();
 	obs_register_source(&universal_media_source_info);
 	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
 	return true;
@@ -20,5 +21,6 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	universal_media_terminate_bundled_processes();
 	obs_log(LOG_INFO, "plugin unloaded");
 }
